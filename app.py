@@ -1,5 +1,8 @@
 import os
 from flask import Flask, render_template
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from api import register_routes
 

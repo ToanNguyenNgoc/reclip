@@ -8,6 +8,7 @@ import threading
 from flask import Blueprint, request, jsonify, send_file
 
 from utils.ytdlp import get_cookie_args
+from utils.auth import require_api_key
 
 MP3_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads", "mp3")
 os.makedirs(MP3_DIR, exist_ok=True)
@@ -99,6 +100,7 @@ def _run_mp3_download(job_id: str, url: str) -> None:
 
 
 @mp3_bp.route("/api/mp3", methods=["POST"])
+@require_api_key
 def mp3_start():
     """Async: start MP3 download, return job_id immediately.
 
@@ -123,10 +125,12 @@ def mp3_start():
         "status": "downloading",
         "status_url": f"{base}/api/mp3/status/{job_id}",
         "media_url": f"{base}/media/{job_id}.mp3",
+        "origin_url": f"/media/{job_id}.mp3"
     })
 
 
 @mp3_bp.route("/api/mp3/sync", methods=["POST"])
+@require_api_key
 def mp3_sync():
     """Sync: block until MP3 is ready, return media link.
 
