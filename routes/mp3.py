@@ -2,6 +2,8 @@ import os
 import re
 import uuid
 import glob
+import json
+import fcntl
 import subprocess
 import threading
 
@@ -11,11 +13,11 @@ from utils.ytdlp import get_cookie_args
 from utils.auth import require_api_key
 
 MP3_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads", "mp3")
+JOBS_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads", "jobs")
 os.makedirs(MP3_DIR, exist_ok=True)
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 mp3_bp = Blueprint("mp3", __name__)
-
-mp3_jobs = {}
 
 # Pattern: [download]  45.3% of 4.20MiB at 1.23MiB/s ETA 00:02
 _PROGRESS_RE = re.compile(
@@ -26,15 +28,63 @@ _PROGRESS_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# File-based job store (works across Gunicorn multi-worker processes)
+# ---------------------------------------------------------------------------
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+
+def _load_job(job_id: str) -> dict | None:
+    """Read a job's state from disk. Returns None if not found."""
+    path = _job_path(job_id)
+    try:
+        with open(path, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _save_job(job_id: str, data: dict) -> None:
+    """Atomically write job state to disk."""
+    path = _job_path(job_id)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f, fcntl.LOCK_UN)
+    os.replace(tmp_path, path)
+
+
+def _update_job(job_id: str, **kwargs) -> None:
+    """Load job from disk, apply kwargs, and save back."""
+    job = _load_job(job_id) or {}
+    job.update(kwargs)
+    _save_job(job_id, job)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _build_media_url(req, job_id: str) -> str:
     """Build the public URL for a finished MP3 job."""
     base = req.host_url.rstrip("/")
     return f"{base}/media/{job_id}.mp3"
 
 
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
 def _run_mp3_download(job_id: str, url: str) -> None:
     """Background worker: download URL as MP3, tracking progress."""
-    job = mp3_jobs[job_id]
     out_template = os.path.join(MP3_DIR, f"{job_id}.%(ext)s")
 
     cmd = [
@@ -61,21 +111,28 @@ def _run_mp3_download(job_id: str, url: str) -> None:
             m = _PROGRESS_RE.search(line.rstrip())
             if m:
                 pct = round(float(m.group(1)), 1)
-                job["progress"] = pct
+                updates = {"progress": pct}
                 if m.group(2):
-                    job["speed"] = m.group(2)
+                    updates["speed"] = m.group(2)
                 if m.group(3):
-                    job["eta"] = m.group(3)
+                    updates["eta"] = m.group(3)
+
                 # Download hit 100% → yt-dlp hands off to ffmpeg for conversion
-                if pct >= 100.0 and job["status"] == "downloading":
-                    job["status"] = "converting"
+                job = _load_job(job_id) or {}
+                if pct >= 100.0 and job.get("status") == "downloading":
+                    updates["status"] = "converting"
+
+                _update_job(job_id, **updates)
 
         _, stderr_output = proc.communicate(timeout=300)
         stderr_lines = stderr_output.strip().splitlines()
 
         if proc.returncode != 0:
-            job["status"] = "error"
-            job["error"] = stderr_lines[-1] if stderr_lines else "Unknown error"
+            _update_job(
+                job_id,
+                status="error",
+                error=stderr_lines[-1] if stderr_lines else "Unknown error",
+            )
             return
 
         files = glob.glob(os.path.join(MP3_DIR, f"{job_id}.*"))
@@ -83,21 +140,25 @@ def _run_mp3_download(job_id: str, url: str) -> None:
         chosen = mp3_files[0] if mp3_files else (files[0] if files else None)
 
         if not chosen:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
+            _update_job(
+                job_id,
+                status="error",
+                error="Download completed but no file was found",
+            )
             return
 
-        job["progress"] = 100.0
-        job["status"] = "done"
-        job["file"] = chosen
+        _update_job(job_id, progress=100.0, status="done", file=chosen)
+
     except subprocess.TimeoutExpired:
         proc.kill()
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        _update_job(job_id, status="error", error="Download timed out (5 min limit)")
     except Exception as exc:
-        job["status"] = "error"
-        job["error"] = str(exc)
+        _update_job(job_id, status="error", error=str(exc))
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @mp3_bp.route("/api/mp3", methods=["POST"])
 @require_api_key
@@ -113,7 +174,7 @@ def mp3_start():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:12]
-    mp3_jobs[job_id] = {"status": "downloading", "url": url}
+    _save_job(job_id, {"status": "downloading", "url": url, "progress": 0.0})
 
     thread = threading.Thread(target=_run_mp3_download, args=(job_id, url))
     thread.daemon = True
@@ -144,13 +205,13 @@ def mp3_sync():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:12]
-    mp3_jobs[job_id] = {"status": "downloading", "url": url}
+    _save_job(job_id, {"status": "downloading", "url": url, "progress": 0.0})
 
     _run_mp3_download(job_id, url)
 
-    job = mp3_jobs[job_id]
-    if job["status"] == "error":
-        return jsonify({"error": job.get("error", "Unknown error")}), 500
+    job = _load_job(job_id)
+    if not job or job["status"] == "error":
+        return jsonify({"error": job.get("error", "Unknown error") if job else "Job lost"}), 500
 
     return jsonify({
         "job_id": job_id,
@@ -168,7 +229,7 @@ def mp3_status(job_id):
     Response (done):        { "status": "done",         "progress": 100.0, "media_url": "..." }
     Response (error):       { "status": "error",        "error": "..." }
     """
-    job = mp3_jobs.get(job_id)
+    job = _load_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
 
@@ -197,7 +258,7 @@ def serve_mp3(job_id):
       1. File path recorded in the job dict (fastest).
       2. Direct disk lookup (survives server restarts / race conditions).
     """
-    job = mp3_jobs.get(job_id)
+    job = _load_job(job_id)
     disk_path = os.path.join(MP3_DIR, f"{job_id}.mp3")
 
     if job and job["status"] == "done" and job.get("file"):
