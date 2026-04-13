@@ -283,3 +283,32 @@ def serve_mp3(job_id):
         download_name=os.path.basename(file_path),
         conditional=True,             # enables Range / ETags
     )
+
+
+@mp3_bp.route("/media/<job_id>.mp3", methods=["DELETE"])
+@require_api_key
+def delete_mp3(job_id):
+    """Delete a finished MP3 file and its job metadata.
+
+    DELETE /media/<job_id>.mp3
+    Response (success): { "message": "Deleted", "job_id": "..." }
+    Response (404):     { "error": "File not found" }
+    """
+    mp3_path = os.path.join(MP3_DIR, f"{job_id}.mp3")
+    job_path = _job_path(job_id)
+
+    if not os.path.isfile(mp3_path):
+        return jsonify({"error": "File not found"}), 404
+
+    # Remove the MP3 file
+    os.remove(mp3_path)
+
+    # Also remove any other leftover formats (e.g. .webm, .m4a)
+    for leftover in glob.glob(os.path.join(MP3_DIR, f"{job_id}.*")):
+        os.remove(leftover)
+
+    # Remove the job metadata file
+    if os.path.isfile(job_path):
+        os.remove(job_path)
+
+    return jsonify({"message": "Deleted", "job_id": job_id})
